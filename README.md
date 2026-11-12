@@ -286,3 +286,7 @@ kicad-cli sch export bom -o campionatore-ir-bom.csv ESP32custom.kicad_sch
 ## Licenza
 
 [MIT](LICENSE)
+
+## Test push
+
+Verifica push con account **DeepDruido** — 12/11/2026.
