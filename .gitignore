@@ -1,0 +1,11 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# KiCad: backup, cache e file locali
+*-backups/
+*.lck
+_autosave-*
+~*
+fp-info-cache
+*.kicad_prl
