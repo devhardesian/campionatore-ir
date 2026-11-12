@@ -4,18 +4,31 @@
 //  Campionatore IR — configurazione
 // =============================================================================
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 // ---- Rete Wi-Fi --------------------------------------------------------------
-// Rete di casa (modalità Station). Lasciare WIFI_SSID vuoto per usare solo l'AP.
+// Rete predefinita del firmware (facoltativa). Altre reti si aggiungono dalla
+// Web App (⋮ → Wi-Fi) e restano nella NVS: sopravvivono a "uploadfs" e agli
+// aggiornamenti del firmware. Una rete salvata dall'app con lo stesso nome ha
+// la precedenza su questa (es. dopo un cambio di password del router).
 #define WIFI_SSID ""
 #define WIFI_PASSWORD ""
-#define WIFI_CONNECT_TIMEOUT_MS 20000
+#define WIFI_CONNECT_TIMEOUT_MS 20000  // tempo massimo per collegarsi a una rete
+#define WIFI_MAX_NETWORKS 5            // reti salvabili dall'app
+#define WIFI_LOST_FALLBACK_MS 120000   // rete persa da 2 min -> Access Point
+#define WIFI_AP_RETRY_MS 60000         // in AP: ogni minuto cerca le reti note
+#define WIFI_AP_LINGER_MS 120000       // AP ancora acceso dopo una connessione dall'app
 
-// Access Point di ripiego, attivato se la connessione alla rete di casa fallisce.
+// Access Point di ripiego, attivo quando nessuna rete nota è raggiungibile.
 // Indirizzo della Web App in modalità AP: http://192.168.4.1
+// AP_PASSWORD è la password predefinita: si cambia dalla Web App.
 #define AP_SSID "Campionatore-IR"
-#define AP_PASSWORD "irremote123"  // minimo 8 caratteri
+#define AP_PASSWORD "irremote123"  // 8-63 caratteri
+
+// Tasto BOOT della scheda: tenuto premuto per 5 s ripristina la password
+// predefinita dell'Access Point e riavvia (-1 per disattivare).
+#define RESET_BUTTON_PIN 0
+#define RESET_BUTTON_HOLD_MS 5000
 
 // Nome mDNS: http://campionatore-ir.local
 #define HOSTNAME "campionatore-ir"

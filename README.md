@@ -96,7 +96,8 @@ Lo schema completo è in [`hardware/campionatore-ir-schema.pdf`](hardware/campio
 │   ├── platformio.ini
 │   ├── include/config.h          Wi-Fi, pin, tempi di campionamento
 │   ├── src/
-│   │   ├── main.cpp              avvio, Wi-Fi, mDNS, web server
+│   │   ├── main.cpp              avvio, web server
+│   │   ├── wifi_manager.*        reti Wi-Fi salvate, Access Point, mDNS
 │   │   ├── ir_engine.*           task IR: campionamento, trasmissione RMT, salvataggi
 │   │   ├── ir_demod.h            demodulatore software (mark/space + misura della portante)
 │   │   ├── json_scan.h           lettore JSON in streaming (backup e vecchi database)
@@ -115,16 +116,22 @@ Lo schema completo è in [`hardware/campionatore-ir-schema.pdf`](hardware/campio
 
 Serve [PlatformIO](https://platformio.org/) (estensione di VS Code oppure riga di comando).
 
-**1. Configura la rete.** In `firmware/include/config.h` inserisci la rete di casa:
+**1. Configura la rete (facoltativo).** Le reti Wi-Fi si aggiungono dalla web app (⋮ → *Wi-Fi e Access
+Point*) e restano nella NVS dell'ESP32, quindi sopravvivono a `uploadfs` e agli aggiornamenti del firmware. In
+`firmware/include/config.h` puoi comunque indicare una rete predefinita, usata insieme a quelle salvate:
 
 ```c
 #define WIFI_SSID "NomeRete"
 #define WIFI_PASSWORD "password"
 ```
 
-Se `WIFI_SSID` resta vuoto, o la connessione non riesce entro 20 s, il dispositivo crea l'Access Point
-**`Campionatore-IR`** (password `irremote123`, da cambiare in `AP_PASSWORD`) e la web app è su
-**http://192.168.4.1**.
+All'avvio il dispositivo si collega alla rete nota con il segnale migliore. Se nessuna risponde crea l'Access
+Point **`Campionatore-IR`** e la web app è su **http://192.168.4.1**; finché nessun telefono è collegato all'AP,
+ogni minuto riprova le reti note (utile dopo un black-out, quando il router si riaccende dopo l'ESP32). Se la
+rete cade per più di 2 minuti torna in Access Point.
+
+La password predefinita dell'Access Point è `irremote123`: **cambiala** dalla web app. Se la dimentichi, tieni
+premuto il tasto **BOOT** per 5 secondi: torna quella predefinita e il dispositivo si riavvia.
 
 **2. Controlla la flash.** `platformio.ini` è impostato per moduli da 8 MB; le righe commentate spiegano come
 passare a 4 o 16 MB e come attivare la PSRAM.
@@ -159,6 +166,14 @@ Per averla a schermo intero: menu del browser → *Aggiungi a schermata Home*.
   a pochi centimetri.
 - **Usare un tasto**: un tocco trasmette; volume, canali e frecce si ripetono tenendoli premuti.
 - **✎ Modifica**: un tocco registra di nuovo il tasto, × lo elimina, in fondo c'è *Elimina telecomando*.
+- **⋮ → Wi-Fi e Access Point**: stato della connessione, reti salvate (fino a 5, il cestino le dimentica),
+  *Aggiungi rete* e *Cambia password* dell'Access Point.
+  - *Aggiungi rete* elenca le reti visibili (l'ESP32 vede solo quelle a 2,4 GHz); *Altra rete…* serve per le
+    reti nascoste. Una rete viene salvata solo se la connessione riesce.
+  - Dall'**Access Point** (primo avvio, nuova casa, router cambiato) il dispositivo prova la rete tenendo acceso
+    l'AP e mostra il nuovo indirizzo; l'AP si spegne 2 minuti dopo.
+  - Da una **rete di casa**, *Connetti* sposta subito il dispositivo sulla nuova rete (se non ci riesce torna su
+    quella di prima), mentre *Salva* la memorizza per quando sarà a portata, per esempio prima di un trasloco.
 
 ## API REST
 
@@ -177,6 +192,12 @@ in caso di errore `{"ok": false, "error": "…"}`.
 | DELETE | `/api/delete` | `remote`, `button` facoltativo | Elimina un tasto o l'intero telecomando |
 | POST | `/api/import` | corpo = JSON del backup | Ripristina un backup |
 | GET | `/api/info` | | Versione, rete, memoria, spazio sulla flash, tasti registrati |
+| GET | `/api/wifi` | | Modalità (`sta` / `ap` / `connecting`), reti salvate, stato dell'AP, ultimo tentativo (`attempt`) |
+| GET | `/api/wifi/scan` | `refresh=1` facoltativo | Reti visibili; `scanning: true` finché la ricerca è in corso |
+| POST | `/api/wifi/connect` | `ssid`, `password` (vuota per reti aperte) | Prova la rete e, se riesce, la salva |
+| POST | `/api/wifi/networks` | `ssid`, `password` | Salva una rete senza collegarsi |
+| DELETE | `/api/wifi/networks` | `ssid` | Dimentica una rete salvata |
+| POST | `/api/wifi/ap` | `password` (8-63 caratteri ASCII) | Cambia la password dell'Access Point |
 
 Un giro completo da terminale: creare un telecomando, registrare il tasto Power e trasmetterlo.
 
@@ -194,6 +215,15 @@ curl -X POST http://campionatore-ir.local/api/send -d "remote=3fa2c1d0&button=po
 # elimina il tasto
 curl -X DELETE "http://campionatore-ir.local/api/delete?remote=3fa2c1d0&button=power"
 ```
+
+Collegare il dispositivo a una rete partendo dall'Access Point:
+
+```bash
+curl -X POST http://192.168.4.1/api/wifi/connect -d "ssid=Casa&password=segreta123"
+curl http://192.168.4.1/api/wifi                     # "attempt": {"state":"ok","ip":"192.168.1.77",…}
+```
+
+Le reti salvate e la password dell'AP non fanno parte del backup e le API non restituiscono mai le password.
 
 Backup e ripristino:
 
@@ -275,6 +305,9 @@ kicad-cli sch export bom -o campionatore-ir-bom.csv ESP32custom.kicad_sch
 - **`campionatore-ir.local` non risponde**: i nomi `.local` (mDNS) viaggiano in multicast sul Wi-Fi e qualche
   risposta va persa. Usa l'indirizzo IP (meglio se riservato nel router) oppure il nome che il router registra
   nel proprio DNS, per esempio `http://campionatore-ir.station/`.
+- **Il dispositivo non torna sulla rete di casa**: dopo 2 minuti senza rete accende l'Access Point. Collegati a
+  `Campionatore-IR` e controlla le reti da ⋮ → *Wi-Fi e Access Point*; il monitor seriale stampa il motivo di
+  ogni tentativo fallito (rete non trovata, password errata…).
 - **Il segnale non viene ricevuto**: con un fotodiodo e 10 kΩ di pull-up la sensibilità è bassa, quindi il
   telecomando va tenuto a 1–5 cm. Per più portata porta il pull-up a 47–100 kΩ oppure usa un ricevitore TSOP.
 - **Un condizionatore non risponde**: registra di nuovo la combinazione tenendo il telecomando fermo e vicino.

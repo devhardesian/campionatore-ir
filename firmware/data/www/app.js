@@ -38,6 +38,12 @@ const ICONS = {
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
   share: '<path d="M12 3v12"/><path d="m8 7 4-4 4 4"/><path d="M8 11H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2h-2"/>',
   addHome: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 8v8M8 12h8"/>',
+  wifi: '<path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><path d="M12 20h.01"/>',
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M16 7l3 3M18 5l2 2"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-6.5 0-10-7-10-7a18.5 18.5 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c6.5 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="m1 1 22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>',
 };
 
 function icon(name) {
@@ -76,7 +82,9 @@ class ApiError extends Error {
   }
 }
 
-async function request(method, path, params, body) {
+// timeoutMs: utile quando il dispositivo sta cambiando rete e la richiesta
+// resterebbe appesa per decine di secondi invece di fallire.
+async function request(method, path, params, body, timeoutMs = 0) {
   let url = path;
   const opts = { method, headers: {} };
   if (params) {
@@ -92,10 +100,18 @@ async function request(method, path, params, body) {
     opts.headers['Content-Type'] = 'application/json';
   }
   let res;
+  let timer = null;
+  if (timeoutMs && typeof AbortController === 'function') {
+    const ctl = new AbortController();
+    opts.signal = ctl.signal;
+    timer = setTimeout(() => ctl.abort(), timeoutMs);
+  }
   try {
     res = await fetch(url, opts);
   } catch {
     throw new ApiError('Dispositivo non raggiungibile', 0);
+  } finally {
+    clearTimeout(timer);
   }
   let data = null;
   try { data = await res.json(); } catch { /* risposta senza JSON */ }
@@ -116,6 +132,12 @@ const api = {
   remove: (remote, button) => request('DELETE', '/api/delete', button ? { remote, button } : { remote }),
   importDb: (json) => request('POST', '/api/import', null, json),
   info: () => request('GET', '/api/info'),
+  wifi: (timeoutMs) => request('GET', '/api/wifi', null, undefined, timeoutMs),
+  wifiScan: (refresh) => request('GET', '/api/wifi/scan', refresh ? { refresh: 1 } : null, undefined, 6000),
+  wifiConnect: (ssid, password) => request('POST', '/api/wifi/connect', { ssid, password }),
+  wifiSave: (ssid, password) => request('POST', '/api/wifi/networks', { ssid, password }),
+  wifiForget: (ssid) => request('DELETE', '/api/wifi/networks', { ssid }),
+  apPassword: (password) => request('POST', '/api/wifi/ap', { password }),
 };
 
 // ---------------------------------------------------------------- Stato ----
@@ -607,6 +629,374 @@ async function infoDialog() {
   }
 }
 
+// ---------------------------------------------------------------- Wi-Fi ----
+// Reti salvate, aggiunta di una rete (scansione o nome inserito a mano) e
+// password dell'Access Point. Le reti restano nella NVS del dispositivo.
+const AP_PASS_RE = /^[\x20-\x7e]{8,63}$/;
+const signalLevel = (rssi) => (rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : 1);
+const signalText = (rssi) => ['', 'debole', 'discreto', 'buono', 'ottimo'][signalLevel(rssi)];
+const minutes = (s) => { const m = Math.max(1, Math.round(s / 60)); return m === 1 ? 'un minuto' : `${m} minuti`; };
+
+function signalBars(rssi) {
+  const lvl = signalLevel(rssi);
+  return el('span', { class: 'bars', role: 'img', 'aria-label': `Segnale ${signalText(rssi)}`, title: `${rssi} dBm` },
+    [1, 2, 3, 4].map((i) => el('i', { class: i <= lvl ? 'on' : null })));
+}
+
+function passwordToggle(...inputs) {
+  const b = el('button', { class: 'icon-btn pw-toggle', type: 'button', 'aria-label': 'Mostra password' }, icon('eye'));
+  b.addEventListener('click', () => {
+    const show = inputs[0].type === 'password';
+    inputs.forEach((i) => { i.type = show ? 'text' : 'password'; });
+    b.replaceChildren(icon(show ? 'eyeOff' : 'eye'));
+    b.setAttribute('aria-label', show ? 'Nascondi password' : 'Mostra password');
+  });
+  return b;
+}
+
+const passwordInput = (props = {}) => el('input', {
+  class: 'input', type: 'password', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', ...props,
+});
+
+async function wifiDialog() {
+  let w;
+  try {
+    w = await api.wifi(6000);
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  const sta = w.mode === 'sta';
+  const go = (fn) => () => { sheet.close(); fn(); };
+
+  const status = el('div', { class: 'net-status' },
+    el('span', { class: 'ic' + (sta ? '' : ' warn') }, icon('wifi')),
+    el('div', {},
+      el('b', {}, sta ? `Connesso a «${w.ssid}»`
+        : w.mode === 'connecting' ? `Connessione a «${w.ssid}»…` : `Access Point «${w.ap.ssid}»`),
+      el('div', { class: 'small muted' }, sta
+        ? `${w.ip} · segnale ${signalText(w.rssi)} (${w.rssi} dBm)`
+        : 'Nessuna rete salvata raggiungibile'),
+      sta && w.ap.active && el('div', { class: 'small muted' },
+        `Access Point ancora attivo${w.ap.offIn != null ? ` per ${minutes(w.ap.offIn)}` : ''}`)));
+
+  const saved = w.networks.length
+    ? el('div', { class: 'net-list' }, w.networks.map((n) => el('div', { class: 'net-row' },
+      icon(n.open ? 'wifi' : 'lock'),
+      el('span', { class: 'net-name' }, n.ssid),
+      sta && n.ssid === w.ssid && el('span', { class: 'tag ok' }, 'in uso'),
+      n.firmware
+        ? el('span', { class: 'tag', title: 'Definita in config.h' }, 'firmware')
+        : el('button', {
+          class: 'icon-btn sm', type: 'button', 'aria-label': `Dimentica ${n.ssid}`,
+          onclick: () => forgetNetwork(sheet, n.ssid, sta && n.ssid === w.ssid),
+        }, icon('trash')))))
+    : el('p', { class: 'small muted' }, 'Nessuna rete salvata: il dispositivo resta in modalità Access Point.');
+
+  const sheet = openSheet({
+    title: 'Wi-Fi',
+    body: el('div', {},
+      status,
+      el('div', { class: 'net-section' },
+        el('h3', { class: 'section-title' }, 'Reti salvate'),
+        saved,
+        el('button', { class: 'btn block', type: 'button', onclick: go(() => addNetworkDialog(w)) },
+          icon('plus'), 'Aggiungi rete')),
+      el('div', { class: 'net-section' },
+        el('h3', { class: 'section-title' }, 'Access Point'),
+        el('p', { class: 'small muted' },
+          `La rete «${w.ap.ssid}» si accende quando nessuna rete salvata è raggiungibile: collegati e apri http://192.168.4.1.`),
+        w.ap.defaultPassword && el('div', { class: 'note warn' }, icon('lock'),
+          'Usa ancora la password predefinita: chiunque la conosca può collegarsi.'),
+        el('button', { class: 'btn block', type: 'button', onclick: go(() => apPasswordDialog(w)) },
+          icon('key'), 'Cambia password'))),
+    actions: [{ label: 'Chiudi', cls: 'primary' }],
+  });
+}
+
+async function forgetNetwork(sheet, ssid, inUse) {
+  const msg = inUse
+    ? `Il dispositivo resta collegato a «${ssid}» fino al prossimo riavvio, poi non la userà più.`
+    : `Il dispositivo non si collegherà più a «${ssid}».`;
+  if (!(await confirmDialog('Dimentica rete', msg, 'Dimentica', true))) return;
+  try {
+    await api.wifiForget(ssid);
+    toast(`Rete «${ssid}» dimenticata`);
+    sheet.close();
+    wifiDialog();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+function addNetworkDialog(w) {
+  const hint = el('p', { class: 'small muted' }, 'Ricerca delle reti…');
+  const list = el('div', { class: 'net-list' });
+  let active = true;
+  let scanning = false;
+
+  const pick = (opts) => { sheet.close(); credentialsDialog(w, opts); };
+  const otherRow = () => el('button', { class: 'net-row', type: 'button', onclick: () => pick({ manual: true }) },
+    icon('plus'), el('span', { class: 'net-name' }, 'Altra rete…'));
+
+  function show(nets) {
+    list.replaceChildren(...nets.map((n) => el('button', {
+      class: 'net-row', type: 'button', onclick: () => pick({ ssid: n.ssid, secure: n.secure }),
+    }, signalBars(n.rssi), el('span', { class: 'net-name' }, n.ssid),
+    n.saved && el('span', { class: 'tag' }, 'salvata'),
+    n.secure && icon('lock'))), otherRow());
+  }
+
+  // La scansione dura qualche secondo; durante la ricerca alcune richieste
+  // possono andare perse (la radio cambia canale), quindi si riprova.
+  async function scan(refresh) {
+    if (scanning) return;
+    scanning = true;
+    hint.textContent = 'Ricerca delle reti…';
+    let failures = 0;
+    let first = true;
+    const t0 = Date.now();
+    try {
+      while (active && Date.now() - t0 < 25000) {
+        let r;
+        try {
+          r = await api.wifiScan(first && refresh);
+          first = false;
+          failures = 0;
+        } catch (e) {
+          if (++failures >= 5) throw e;
+          await sleep(800);
+          continue;
+        }
+        if (!active) return;
+        if (r.networks.length || !r.scanning) show(r.networks);
+        if (!r.scanning) {
+          hint.textContent = r.networks.length
+            ? 'Scegli la rete. Il dispositivo vede solo le reti a 2,4 GHz.'
+            : 'Nessuna rete trovata. Il dispositivo vede solo le reti a 2,4 GHz.';
+          return;
+        }
+        await sleep(800);
+      }
+      if (active) hint.textContent = 'La ricerca non ha risposto in tempo: riprova.';
+    } catch (e) {
+      if (active) hint.textContent = e.message;
+    } finally {
+      scanning = false;
+      if (active && !list.childElementCount) list.append(otherRow());
+    }
+  }
+
+  const sheet = openSheet({
+    title: 'Aggiungi rete',
+    body: el('div', {}, hint, list),
+    actions: [
+      { label: 'Indietro', cls: 'ghost', onClick: (s) => { s.close(); wifiDialog(); } },
+      { label: 'Aggiorna', icon: 'refresh', onClick: () => scan(true) },
+    ],
+    onClose: () => { active = false; },
+  });
+  scan(false);
+}
+
+function credentialsDialog(w, { ssid = '', secure = true, manual = false } = {}) {
+  const sta = w.mode === 'sta';
+  const ssidInput = manual && el('input', {
+    class: 'input', value: ssid, placeholder: 'Nome della rete (SSID)', maxlength: 32,
+    autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
+  });
+  const askPass = manual || secure;
+  const pass = passwordInput({ maxlength: 64, enterkeyhint: 'go', placeholder: manual ? 'Vuota se la rete è aperta' : '' });
+
+  const read = () => {
+    const s = manual ? ssidInput.value.trim() : ssid;
+    const p = askPass ? pass.value : '';
+    if (!s) { ssidInput.focus(); return null; }
+    if (!manual && secure && !p) { pass.focus(); return null; }
+    if (p && (p.length < 8 || p.length > 64)) {
+      toast('La password Wi-Fi deve avere da 8 a 63 caratteri', 'error');
+      pass.focus();
+      return null;
+    }
+    return { ssid: s, password: p, secure: !!p, manual };
+  };
+  const doConnect = (s) => {
+    const c = read();
+    if (!c) return;
+    s.close();
+    connectFlow(w, c);
+  };
+  const doSave = async (s) => {
+    const c = read();
+    if (!c) return;
+    try {
+      await api.wifiSave(c.ssid, c.password);
+      s.close();
+      toast(`Rete «${c.ssid}» salvata`, 'ok');
+      wifiDialog();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  };
+
+  const sheet = openSheet({
+    title: manual ? 'Altra rete' : `Rete «${ssid}»`,
+    body: el('div', {},
+      manual && el('div', { class: 'field' }, el('label', {}, 'Nome della rete'), ssidInput),
+      askPass && el('div', { class: 'field' }, el('label', {}, 'Password'),
+        el('div', { class: 'pw' }, pass, passwordToggle(pass))),
+      el('p', { class: 'small muted' }, sta
+        ? `«Connetti» sposta subito il dispositivo su questa rete; se non ci riesce torna su «${w.ssid}». «Salva» la memorizza per quando sarà a portata.`
+        : 'Il dispositivo prova a collegarsi tenendo acceso l’Access Point, così puoi leggere qui il risultato.')),
+    actions: [
+      { label: 'Annulla', cls: 'ghost', onClick: (s) => { s.close(); addNetworkDialog(w); } },
+      sta && { label: 'Salva', onClick: doSave },
+      { label: 'Connetti', cls: 'primary', onClick: doConnect },
+    ].filter(Boolean),
+  });
+  pass.addEventListener('keydown', (e) => { if (e.key === 'Enter') doConnect(sheet); });
+  setTimeout(() => (manual && !ssid ? ssidInput : askPass ? pass : null)?.focus(), 60);
+}
+
+async function connectFlow(w, cred) {
+  let res;
+  try {
+    res = await api.wifiConnect(cred.ssid, cred.password);
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  const fromSta = w.mode === 'sta';
+  const status = el('p', {}, `Connessione a «${cred.ssid}»…`);
+  let active = true;
+  const sheet = openSheet({
+    title: 'Connessione in corso',
+    body: el('div', { class: 'learn' },
+      el('div', { class: 'learn-anim net' }, icon('wifi')),
+      status,
+      el('p', { class: 'small muted' }, fromSta
+        ? 'Mentre cambia rete il dispositivo non risponde: attendi qualche secondo.'
+        : 'Il telefono potrebbe perdere per un momento il collegamento all’Access Point.')),
+    actions: [{ label: 'Chiudi', cls: 'ghost' }],
+    onClose: () => { active = false; },
+  });
+
+  const t0 = Date.now();
+  // Da Station il dispositivo sparisce: se dopo un errore torna sulla rete di
+  // prima lo rivediamo entro ~30 s, altrimenti è rimasto sulla nuova rete.
+  const limit = (fromSta ? 45 : 60) * 1000;
+  const retry = (s) => { s.close(); credentialsDialog(w, cred); };
+  while (active) {
+    await sleep(1000);
+    let st = null;
+    try { st = await api.wifi(4000); } catch { /* sta cambiando rete */ }
+    if (!active) return;
+    const a = st && st.attempt && st.attempt.id === res.attempt ? st.attempt : null;
+    if (a && a.state === 'ok') return showConnectDone(sheet, st, a, fromSta);
+    if (a && a.state === 'failed') return showConnectFailure(sheet, a, retry);
+    if (Date.now() - t0 > limit) return showConnectLost(sheet, w, cred.ssid, fromSta);
+    status.textContent = `Connessione a «${cred.ssid}»… ${Math.round((Date.now() - t0) / 1000)} s`;
+  }
+}
+
+function showConnectDone(sheet, st, a, fromSta) {
+  const url = `http://${a.ip}/`;
+  sheet.render({
+    title: 'Connesso',
+    body: el('div', { class: 'learn' },
+      el('div', { class: 'learn-anim done' }, icon('check')),
+      el('p', {}, `Il dispositivo è collegato a «${a.ssid}» e la rete è stata salvata.`),
+      el('p', { class: 'addr' }, el('a', { href: url }, url)),
+      !fromSta && el('p', { class: 'small muted' },
+        `L’Access Point si spegnerà tra ${minutes((st.ap && st.ap.offIn) || 120)}: collega il telefono a «${a.ssid}» e apri l’indirizzo qui sopra (oppure http://${st.hostname}.local).`)),
+    actions: [{ label: 'Fatto', cls: 'primary' }],
+  });
+}
+
+function showConnectFailure(sheet, a, retry) {
+  sheet.render({
+    title: 'Connessione non riuscita',
+    body: el('div', { class: 'learn' },
+      el('div', { class: 'learn-anim fail' }, icon('wifi')),
+      el('p', {}, a.error || 'Connessione non riuscita.'),
+      el('p', { class: 'small muted' }, a.fallback
+        ? `Il dispositivo è tornato su «${a.fallback}». La rete non è stata salvata.`
+        : 'L’Access Point resta attivo. La rete non è stata salvata.')),
+    actions: [{ label: 'Chiudi', cls: 'ghost' }, { label: 'Riprova', cls: 'primary', onClick: retry }],
+  });
+}
+
+function showConnectLost(sheet, w, ssid, fromSta) {
+  const where = `http://${w.hostname}.local`;
+  sheet.render({
+    title: fromSta ? 'Dispositivo su un’altra rete' : 'Collegamento perso',
+    body: el('div', { class: 'learn' },
+      el('div', { class: 'learn-anim fail' }, icon('wifi')),
+      el('p', {}, fromSta
+        ? `Il dispositivo non risponde più su questa rete: con ogni probabilità si è collegato a «${ssid}».`
+        : 'Il telefono si è scollegato dall’Access Point: succede quando il dispositivo si collega alla nuova rete e cambia canale.'),
+      el('p', { class: 'small muted' }, fromSta
+        ? `Collega il telefono a «${ssid}» e apri ${where} o l’indirizzo assegnato dal router.`
+        : `Ricollegati a «${w.ap.ssid}» per vedere il risultato, oppure collega il telefono a «${ssid}» e apri ${where}.`)),
+    actions: [{ label: 'Chiudi', cls: 'primary' }],
+  });
+}
+
+function apPasswordDialog(w) {
+  const p1 = passwordInput({ maxlength: 63, autocomplete: 'new-password' });
+  const p2 = passwordInput({ maxlength: 63, autocomplete: 'new-password', enterkeyhint: 'done' });
+
+  const submit = async (s) => {
+    if (!AP_PASS_RE.test(p1.value)) {
+      toast('La password deve avere da 8 a 63 caratteri, senza lettere accentate né emoji', 'error');
+      p1.focus();
+      return;
+    }
+    if (p1.value !== p2.value) {
+      toast('Le due password non coincidono', 'error');
+      p2.focus();
+      return;
+    }
+    try {
+      const r = await api.apPassword(p1.value);
+      s.close();
+      if (r.restart) {
+        openSheet({
+          title: 'Password cambiata',
+          body: el('p', { class: 'muted' },
+            `L’Access Point si sta riavviando: ricollega il telefono a «${w.ap.ssid}» con la nuova password.`),
+          actions: [{ label: 'OK', cls: 'primary' }],
+        });
+      } else {
+        toast('Password dell’Access Point cambiata', 'ok');
+        wifiDialog();
+      }
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  };
+
+  const sheet = openSheet({
+    title: 'Password dell’Access Point',
+    body: el('div', {},
+      el('p', { class: 'small muted' },
+        `Protegge la rete «${w.ap.ssid}», che il dispositivo accende quando non trova reti note.`),
+      el('div', { class: 'field' }, el('label', {}, 'Nuova password (8-63 caratteri)'),
+        el('div', { class: 'pw' }, p1, passwordToggle(p1, p2))),
+      el('div', { class: 'field' }, el('label', {}, 'Ripeti la password'), p2),
+      w.ap.active && el('p', { class: 'small muted' },
+        'Il telefono collegato all’Access Point verrà disconnesso: ricollegalo con la nuova password.'),
+      w.ap.resetButton && el('p', { class: 'small muted' },
+        'Se la dimentichi, tieni premuto il tasto BOOT del dispositivo per 5 secondi: torna la password predefinita.')),
+    actions: [
+      { label: 'Annulla', cls: 'ghost', onClick: (s) => { s.close(); wifiDialog(); } },
+      { label: 'Salva', cls: 'primary', onClick: submit },
+    ],
+  });
+  p2.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(sheet); });
+  setTimeout(() => p1.focus(), 60);
+}
+
 // ------------------------------------------------- Installazione su iOS ----
 // Su iPhone e iPad il browser non propone da solo l'installazione (non esiste
 // l'evento beforeinstallprompt): alla prima visita spieghiamo come aggiungere
@@ -649,6 +1039,7 @@ function homeMenu() {
     body: el('div', { class: 'menu-list' },
       item('download', 'Esporta backup', exportBackup),
       item('upload', 'Importa backup', importBackup),
+      item('wifi', 'Wi-Fi e Access Point', wifiDialog),
       item('info', 'Informazioni dispositivo', infoDialog),
       canInstallIos() && item('addHome', 'Installa come app', installDialog)),
   });

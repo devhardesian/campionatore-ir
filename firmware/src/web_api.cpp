@@ -3,7 +3,6 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
-#include <WiFi.h>
 
 #include <memory>
 #include <vector>
@@ -11,6 +10,7 @@
 #include "config.h"
 #include "ir_engine.h"
 #include "storage.h"
+#include "wifi_manager.h"
 
 namespace {
 
@@ -345,21 +345,77 @@ void handleLegacyDelete(AsyncWebServerRequest* req) {
 }
 
 void handleInfo(AsyncWebServerRequest* req) {
-  const bool sta = WiFi.status() == WL_CONNECTED;
   JsonDocument d;
-  d["version"] = FW_VERSION;
-  d["mode"] = sta ? "sta" : "ap";
-  d["ssid"] = sta ? WiFi.SSID() : String(AP_SSID);
-  d["ip"] = sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-  if (sta) d["rssi"] = WiFi.RSSI();
-  d["hostname"] = HOSTNAME;
-  d["heap"] = ESP.getFreeHeap();
-  d["psram"] = ESP.getFreePsram();
-  d["fsUsed"] = store.fsUsed();
-  d["fsTotal"] = store.fsTotal();
-  d["buttons"] = store.buttonCount();
-  d["legacy"] = store.hasLegacy();
-  d["uptime"] = millis() / 1000;
+  JsonObject o = d.to<JsonObject>();
+  o["version"] = FW_VERSION;
+  net::infoJson(o);  // mode, ssid, ip, rssi, hostname
+  o["heap"] = ESP.getFreeHeap();
+  o["psram"] = ESP.getFreePsram();
+  o["fsUsed"] = store.fsUsed();
+  o["fsTotal"] = store.fsTotal();
+  o["buttons"] = store.buttonCount();
+  o["legacy"] = store.hasLegacy();
+  o["uptime"] = millis() / 1000;
+  sendJson(req, 200, d);
+}
+
+// ---------------------------------------------------------------------------
+//  Wi-Fi
+// ---------------------------------------------------------------------------
+
+int httpCode(NetResult r) {
+  switch (r) {
+    case NetResult::Ok: return 200;
+    case NetResult::NotFound: return 404;
+    case NetResult::Busy:
+    case NetResult::Full: return 409;
+    case NetResult::ReadOnly: return 403;
+    default: return 400;
+  }
+}
+
+void handleWifiStatus(AsyncWebServerRequest* req) {
+  JsonDocument d;
+  net::statusJson(d.to<JsonObject>());
+  sendJson(req, 200, d);
+}
+
+void handleWifiScan(AsyncWebServerRequest* req) {
+  JsonDocument d;
+  net::scanJson(d.to<JsonObject>(), arg(req, "refresh") == "1");
+  sendJson(req, 200, d);
+}
+
+void handleWifiConnect(AsyncWebServerRequest* req) {
+  uint32_t attempt = 0;
+  const NetResult r = net::connect(arg(req, "ssid"), arg(req, "password"), attempt);
+  if (r != NetResult::Ok) return sendError(req, httpCode(r), net::resultMessage(r));
+  JsonDocument d;
+  d["ok"] = true;
+  d["attempt"] = attempt;
+  d["timeout"] = WIFI_CONNECT_TIMEOUT_MS;
+  sendJson(req, 202, d);
+}
+
+void handleWifiSave(AsyncWebServerRequest* req) {
+  const NetResult r = net::save(arg(req, "ssid"), arg(req, "password"));
+  if (r != NetResult::Ok) return sendError(req, httpCode(r), net::resultMessage(r));
+  sendOk(req, 201);
+}
+
+void handleWifiForget(AsyncWebServerRequest* req) {
+  const NetResult r = net::forget(arg(req, "ssid"));
+  if (r != NetResult::Ok) return sendError(req, httpCode(r), net::resultMessage(r));
+  sendOk(req);
+}
+
+void handleWifiAp(AsyncWebServerRequest* req) {
+  bool restart = false;
+  const NetResult r = net::setApPassword(arg(req, "password"), restart);
+  if (r != NetResult::Ok) return sendError(req, httpCode(r), net::resultMessage(r));
+  JsonDocument d;
+  d["ok"] = true;
+  d["restart"] = restart;
   sendJson(req, 200, d);
 }
 
@@ -405,6 +461,14 @@ void webApiBegin(AsyncWebServer& server) {
   server.on("/api/legacy", HTTP_GET, handleLegacyGet);
   server.on("/api/legacy", HTTP_DELETE, handleLegacyDelete);
   server.on("/api/info", HTTP_GET, handleInfo);
+  // "/api/wifi" corrisponde anche a "/api/wifi/…": i percorsi più specifici
+  // vanno registrati prima.
+  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
+  server.on("/api/wifi/connect", HTTP_POST, handleWifiConnect);
+  server.on("/api/wifi/networks", HTTP_POST, handleWifiSave);
+  server.on("/api/wifi/networks", HTTP_DELETE, handleWifiForget);
+  server.on("/api/wifi/ap", HTTP_POST, handleWifiAp);
+  server.on("/api/wifi", HTTP_GET, handleWifiStatus);
 
   // Web App: il browser rivalida ogni file tramite ETag (risposta 304 se
   // invariato), quindi il codice viene scaricato una sola volta.

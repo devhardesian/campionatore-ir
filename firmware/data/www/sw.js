@@ -3,7 +3,7 @@
 // Nota: i browser attivano i Service Worker solo in contesti sicuri (HTTPS o
 // localhost). Su http://<ip> l'app funziona comunque: la cache è garantita
 // dagli header HTTP (ETag + 304) inviati dall'ESP32.
-const CACHE = 'ir-remote-v1';
+const CACHE = 'ir-remote-v2';
 const ASSETS = ['/', '/style.css', '/app.js', '/manifest.json', '/icon.svg', '/icon-192.png', '/icon-512.png', '/icon-maskable.png'];
 
 self.addEventListener('install', (event) => {

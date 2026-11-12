@@ -13,4 +13,10 @@ class AsyncWebServer;
 //   DELETE /api/delete         elimina telecomando/pulsante   remote, [button]
 //   POST   /api/import         ripristina un backup JSON (corpo = contenuto di remotes.json)
 //   GET    /api/info           stato del dispositivo
+//   GET    /api/wifi           stato della rete, reti salvate, ultimo tentativo
+//   GET    /api/wifi/scan      reti visibili                  [refresh=1]
+//   POST   /api/wifi/connect   collega e, se riesce, salva    ssid, [password]
+//   POST   /api/wifi/networks  salva senza collegarsi         ssid, [password]
+//   DELETE /api/wifi/networks  dimentica una rete             ssid
+//   POST   /api/wifi/ap        password dell'Access Point     password
 void webApiBegin(AsyncWebServer& server);

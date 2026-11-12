@@ -3,69 +3,22 @@
 //
 //  Frontend  : PWA (HTML/CSS/JS) in LittleFS, cartella /www
 //  Backend   : ESPAsyncWebServer + API REST JSON
-//  Storage   : /remotes.json su LittleFS, caricato in RAM all'avvio
+//  Storage   : metadati in /db.json (RAM), segnali in /sig su LittleFS
+//  Rete      : reti Wi-Fi e password dell'AP nella NVS (wifi_manager)
 //  Hardware  : RX fotodiodo su GPIO 18, TX LED IR via 2N2222A su GPIO 17
 // =============================================================================
 
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
-#include <ESPmDNS.h>
 #include <LittleFS.h>
-#include <WiFi.h>
 
 #include "config.h"
 #include "ir_engine.h"
 #include "storage.h"
 #include "web_api.h"
+#include "wifi_manager.h"
 
 static AsyncWebServer server(80);
-
-// Nome di rete "campionatore-ir.local". Va riavviato dopo ogni riconnessione:
-// il responder mDNS perde l'iscrizione al gruppo multicast quando cade il Wi-Fi.
-static void startMdns() {
-  MDNS.end();
-  if (!MDNS.begin(HOSTNAME)) {
-    Serial.println("[mDNS] ERRORE: avvio fallito");
-    return;
-  }
-  MDNS.addService("http", "tcp", 80);
-  Serial.printf("[mDNS] Attivo: http://%s.local\n", HOSTNAME);
-}
-
-static void startWiFi() {
-  WiFi.persistent(false);
-  WiFi.setHostname(HOSTNAME);
-
-  bool connected = false;
-  if (strlen(WIFI_SSID) > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("[WiFi] Connessione a \"%s\"", WIFI_SSID);
-    const uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(250);
-      Serial.print('.');
-    }
-    Serial.println();
-    connected = WiFi.status() == WL_CONNECTED;
-  }
-
-  if (connected) {
-    Serial.printf("[WiFi] Connesso, Web App: http://%s  oppure  http://%s.local\n",
-                  WiFi.localIP().toString().c_str(), HOSTNAME);
-  } else {
-    if (strlen(WIFI_SSID) > 0) Serial.println("[WiFi] Connessione fallita, avvio l'Access Point");
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.printf("[WiFi] Access Point \"%s\" (password \"%s\"), Web App: http://%s\n", AP_SSID,
-                  AP_PASSWORD, WiFi.softAPIP().toString().c_str());
-  }
-
-  WiFi.setSleep(false);  // latenza minima per la Web App
-  startMdns();
-}
 
 void setup() {
   // Il LED IR deve restare spento fin dal primo istante.
@@ -83,25 +36,14 @@ void setup() {
     Serial.println("[FS] ATTENZIONE: Web App assente, esegui 'pio run -t uploadfs'");
 
   ir::begin();
-  startWiFi();
+  net::begin();
   webApiBegin(server);
   server.begin();
   Serial.println("[HTTP] Server avviato");
 }
 
 void loop() {
-  // Tutto il lavoro avviene nel task IR e nel task del web server.
-  static wl_status_t last = WL_IDLE_STATUS;
-  if (WiFi.getMode() == WIFI_STA) {
-    wl_status_t now = WiFi.status();
-    if (now != last) {
-      if (now == WL_CONNECTED) {
-        Serial.printf("[WiFi] Online: %s\n", WiFi.localIP().toString().c_str());
-        startMdns();
-      }
-      else if (last == WL_CONNECTED) Serial.println("[WiFi] Connessione persa, riconnessione...");
-      last = now;
-    }
-  }
-  delay(1000);
+  // IR e web server hanno i loro task; qui gira solo la gestione del Wi-Fi.
+  net::loop();
+  delay(25);
 }
